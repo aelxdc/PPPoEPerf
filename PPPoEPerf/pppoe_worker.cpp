@@ -41,6 +41,7 @@
 #include <functional>
 
 #include <openssl/md5.h>
+#include <openssl/evp.h>
 #include <boost/foreach.hpp>
 
 #include "singleton.h"
@@ -600,13 +601,53 @@ bool PPPoEWorker::send_chap_reply(const MacAddr server_mac,
 
   cache_[session_id] = name_;  // update cache info
 
-  MD5_CTX ctx;
-  MD5_Init(&ctx);
-  MD5_Update(&ctx, &idbyte, 1);
-  MD5_Update(&ctx, (unsigned char *)secret_.c_str(), secret_.size());
-  MD5_Update(&ctx, chal, chal_size);
-  MD5_Final(digest, &ctx);
+  #MD5_CTX ctx;
+  #MD5_Init(&ctx);
+  #MD5_Update(&ctx, &idbyte, 1);
+  #MD5_Update(&ctx, (unsigned char *)secret_.c_str(), secret_.size());
+  #MD5_Update(&ctx, chal, chal_size);
+  #MD5_Final(digest, &ctx);
 
+  unsigned char digest[EVP_MAX_MD_SIZE];  // Buffer para o resultado do digest
+  unsigned int digest_len;  // Tamanho do digest gerado
+
+  EVP_MD_CTX* ctx = EVP_MD_CTX_new();  // Substituir MD5_CTX por EVP_MD_CTX
+
+  if (!EVP_DigestInit_ex(ctx, EVP_md5(), NULL)) {
+       // Tratar erro de inicialização
+      EVP_MD_CTX_free(ctx);
+      return false;
+  }
+
+  if (!EVP_DigestUpdate(ctx, &idbyte, 1)) {
+      // Tratar erro de atualização
+      EVP_MD_CTX_free(ctx);
+      return false;
+  }
+
+  if (!EVP_DigestUpdate(ctx, secret_.c_str(), secret_.size())) {
+      // Tratar erro de atualização
+      EVP_MD_CTX_free(ctx);
+      return false;
+  }
+
+  if (!EVP_DigestUpdate(ctx, chal, chal_size)) {
+      // Tratar erro de atualização
+      EVP_MD_CTX_free(ctx);
+      return false;
+  }
+
+  // Finalize o digest
+  if (!EVP_DigestFinal_ex(ctx, digest, &digest_len)) {
+      // Tratar erro de finalização
+      EVP_MD_CTX_free(ctx);
+      return false;
+  }
+
+  EVP_MD_CTX_free(ctx);  // Liberar o contexto
+
+
+  
   dst.sll_ifindex = src_if_index_;
   dst.sll_halen = ETH_ALEN;
   memcpy(dst.sll_addr, server_mac, sizeof(MacAddr));
