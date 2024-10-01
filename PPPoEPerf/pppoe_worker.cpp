@@ -512,13 +512,6 @@ bool PPPoEWorker::send_chap_reply(const MacAddr server_mac,
 
   cache_[session_id] = name_;  // update cache info
 
-  #MD5_CTX ctx;
-  #MD5_Init(&ctx);
-  #MD5_Update(&ctx, &idbyte, 1);
-  #MD5_Update(&ctx, (unsigned char *)secret_.c_str(), secret_.size());
-  #MD5_Update(&ctx, chal, chal_size);
-  #MD5_Final(digest, &ctx);
-
   unsigned char digest[EVP_MAX_MD_SIZE];  // Buffer para o resultado do digest
   unsigned int digest_len;  // Tamanho do digest gerado
 
