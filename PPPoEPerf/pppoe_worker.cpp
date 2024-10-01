@@ -40,7 +40,7 @@
 #include <iterator>
 #include <functional>
 
-#include <openssl/evp.h>
+#include <openssl/md5.h>
 #include <boost/foreach.hpp>
 
 #include "singleton.h"
@@ -50,102 +50,190 @@
 #include "ppp_random.h"
 #include "logger.hpp"
 
-// Aqui vem o código da classe PPPoEWorker e outros métodos anteriores
+PPPoEWorker::PPPoEWorker(pt::ptree root) {
+  BOOST_FOREACH (pt::ptree::value_type &elem, root.get_child("account")) {
+    std::string usr = elem.first;
+    std::string passwd = elem.second.data();
+    secrets_[usr] = passwd;
+  }
+  assert(!secrets_.empty());
+  iter_last = secrets_.begin();
+  login_period_ = root.get<uint32_t>("period");
+  login_rate_ = root.get<uint16_t>("login-rate");
+}
 
-bool PPPoEWorker::send_chap_reply(const MacAddr server_mac,
-                                  unsigned short session_id, unsigned short id,
-                                  unsigned char *chal, size_t chal_size) {
-  union {
-    struct {
-      struct eth_frame ef;
-      struct pppoe_pkt ps;
-      struct ppp_header ph;
-      struct lcp_pkt chap;
-      unsigned char data[1480];
-    };
+bool PPPoEWorker::init(void) {
+  PPP_LOG(trace) << "PPPoEWorker init";
+  if (!get_src_if_info()) {
+    PPP_LOG(error) << "PPPoEWorker failed to get src mac "
+                   << Singleton<TestConfig>::instance_ptr()->interface_;
+    return false;
+  }
+
+  random_ptr_ = std::make_shared<PPPRandom>();
+  sock_ptr_ = std::make_shared<RawSocket>();
+  return sock_ptr_->init();
+}
+
+bool PPPoEWorker::bind_interface(const std::string &ifname) {
+  PPP_LOG(trace) << "PPPoEWorker bind interface";
+  return sock_ptr_->bind_interface(ifname);
+}
+
+void PPPoEWorker::start(void) {
+  PPP_LOG(trace) << "PPPoEWorker start";
+  thread_ = std::make_shared<std::thread>(std::bind(&PPPoEWorker::loop, this));
+}
+
+void PPPoEWorker::loop() {
+  TestConfig *config = Singleton<TestConfig>::instance_ptr();
+  TestStats *stats = Singleton<TestStats>::instance_ptr();
+  time_t start, cur, last_send;
+  struct timeval timeout;
+
+  start = cur = time(NULL);
+  fd_set rdset;
+  int ret;
+
+  memset(stats, 0, sizeof(TestStats));
+  timeout.tv_sec = 0;
+  timeout.tv_usec = 1000;
+  last_send = 0;
+
+  do {
+    if (cur > last_send)  // time unit is second
+    {
+      last_send = time(NULL);
+      if ((!config->max_padi_cnt_) ||
+          (stats->padi_send_ok_ < config->max_padi_cnt_)) {
+        uint32_t distance = config->max_padi_cnt_ - stats->padi_send_ok_;
+        if (distance >= login_rate_) {
+          distance = login_rate_;
+        }
+        for (size_t i = 0; i < distance; ++i) {
+          if (send_padi()) {
+            ++stats->padi_send_ok_;
+            PPP_LOG(info) << "PPPoEWorker send padi " << stats->padi_send_ok_
+                          << " times";
+          } else {
+            PPP_LOG(error) << "PPPoEWorker send padi failed "
+                           << "with error info " << strerror(errno);
+            ++stats->padi_send_fail_;
+          }
+        }
+      }
+    }
+
+    offline();
+    relogin();
+
+    FD_ZERO(&rdset);
+    FD_SET(sock_ptr_->get_sock_fd(), &rdset);
+    ret = select(sock_ptr_->get_sock_fd() + 1, &rdset, NULL, NULL, &timeout);
+    if (0 == ret) {
+      // timeout
+      cur = time(NULL);
+      process_expired_events(cur);
+      timeout.tv_sec = 0;
+      timeout.tv_usec = 1000;
+
+      if (ppp_timeout_event_.size()) {
+        auto it = ppp_timeout_event_.begin();
+        if (it->timeout_secs_ <= cur) {
+          PPP_LOG(error) << "PPPoEWorker expired event not processed";
+        } else {
+          unsigned int left = it->timeout_secs_ - cur;
+          if (left * 1000 < 1 * 1000) {
+            PPP_LOG(info) << "PPPoEWorker set select timeout with " << left
+                          << " s";
+            timeout.tv_sec = left * 1000;
+            timeout.tv_usec = 0;
+          }
+        }
+      }
+    } else if (-1 == ret) {
+      break;
+    } else {
+      if (FD_ISSET(sock_ptr_->get_sock_fd(), &rdset)) {
+        recv_pkt();
+      }
+      cur = time(NULL);
+      timeout.tv_sec = 0;
+      timeout.tv_usec = 1000;
+    }
+
+    check_echo_expired();
+  } while (start + config->duration_ >= cur);
+  // to inform other thread to finish the thread
+  struct tpacket_stats packet_stats;
+  memset(&packet_stats, 0, sizeof(packet_stats));
+  socklen_t len = 4;
+  getsockopt(sock_ptr_->get_sock_fd(), SOL_PACKET, PACKET_STATISTICS,
+             &packet_stats, &len);
+  PPP_LOG(info) << "tp packets : %d" << packet_stats.tp_packets;
+  PPP_LOG(info) << "tp drops : %d" << packet_stats.tp_drops;
+  do_stop();
+}
+
+void PPPoEWorker::stop(void) {}
+
+void PPPoEWorker::join() { thread_->join(); }
+
+bool PPPoEWorker::get_src_if_info() {
+  TestConfig *config = Singleton<TestConfig>::instance_ptr();
+  struct ifreq req;
+
+  int s = socket(AF_INET, SOCK_DGRAM, 0);
+  if (-1 == s) {
+    return false;
+  }
+  memset(&req, 0, sizeof(req));
+  strncpy(req.ifr_name, config->interface_.c_str(), sizeof(req.ifr_name) - 1);
+  if (-1 == ioctl(s, SIOCGIFHWADDR, &req)) {
+    close(s);
+    return false;
+  }
+  memcpy(&src_if_mac_, req.ifr_hwaddr.sa_data, MAC_ADDR_LEN);
+  if (-1 == ioctl(s, SIOCGIFINDEX, &req)) {
+    close(s);
+    return false;
+  }
+  src_if_index_ = req.ifr_ifindex;
+  close(s);
+
+  return true;
+}
+
+void PPPoEWorker::get_local_mac(MacAddr addr) { memcpy(addr, src_if_mac_, 6); }
+
+bool PPPoEWorker::send_padi(void) {
+  struct {
+    struct eth_frame ef;
+    struct pppoe_pkt di;
+    struct pppoe_tag tag;
   } pkt;
-
   struct sockaddr_ll dst;
-  std::string name_ = name();
-  unsigned short data_size =
-      1 + MD5_DIGEST_LENGTH + name_.size();  // name fgao_test
-  unsigned char digest[MD5_DIGEST_LENGTH] = {0};
-  unsigned char idbyte = id;
-  std::string secret_ = secret(name_);
-
-  cache_[session_id] = name_;  // update cache info
-
-  // Substituição do MD5_Init, MD5_Update e MD5_Final por EVP API
-  unsigned char digest[EVP_MAX_MD_SIZE];  // Buffer para o resultado do digest
-  unsigned int digest_len;  // Tamanho do digest gerado
-
-  EVP_MD_CTX* ctx = EVP_MD_CTX_new();  // Substituir MD5_CTX por EVP_MD_CTX
-
-  if (!EVP_DigestInit_ex(ctx, EVP_md5(), NULL)) {
-       // Tratar erro de inicialização
-      EVP_MD_CTX_free(ctx);
-      return false;
-  }
-
-  if (!EVP_DigestUpdate(ctx, &idbyte, 1)) {
-      // Tratar erro de atualização
-      EVP_MD_CTX_free(ctx);
-      return false;
-  }
-
-  if (!EVP_DigestUpdate(ctx, secret_.c_str(), secret_.size())) {
-      // Tratar erro de atualização
-      EVP_MD_CTX_free(ctx);
-      return false;
-  }
-
-  if (!EVP_DigestUpdate(ctx, chal, chal_size)) {
-      // Tratar erro de atualização
-      EVP_MD_CTX_free(ctx);
-      return false;
-  }
-
-  // Finalize o digest
-  if (!EVP_DigestFinal_ex(ctx, digest, &digest_len)) {
-      // Tratar erro de finalização
-      EVP_MD_CTX_free(ctx);
-      return false;
-  }
-
-  EVP_MD_CTX_free(ctx);  // Liberar o contexto
 
   dst.sll_ifindex = src_if_index_;
   dst.sll_halen = ETH_ALEN;
-  memcpy(dst.sll_addr, server_mac, sizeof(MacAddr));
 
-  memcpy(pkt.ef.dst_, server_mac, sizeof(pkt.ef.dst_));
+  memset(dst.sll_addr, 0xff, sizeof(src_if_mac_));
+  memset(pkt.ef.dst_, 0xff, sizeof(pkt.ef.dst_));
   MacAddr addr;
   get_local_mac(addr);
   memcpy(pkt.ef.src_, addr, sizeof(src_if_mac_));
 
-  pkt.ef.type_ = htons(ETH_P_PPP_SES);
+  pkt.ef.type_ = htons(ETH_P_PPP_DISC);
+  pkt.di.ver_ = PPPOE_DISC_VER;
+  pkt.di.type_ = PPPOE_DISC_TYPE;
+  pkt.di.code_ = PPPOE_DISC_CODE_PADI;
+  pkt.di.session_id_ = 0;
+  pkt.di.length_ = htons(4);
+  pkt.tag.type_ = htons(PPPOE_TAG_SERVICE_NAME);
+  pkt.tag.len_ = 0;
 
-  pkt.ps.ver_ = PPPOE_DISC_VER;
-  pkt.ps.type_ = PPPOE_DISC_TYPE;
-  pkt.ps.code_ = PPPOE_SESS_CODE_DATA;
-  pkt.ps.session_id_ = htons(session_id);
-  pkt.ps.length_ = htons(sizeof(pkt.ph) + sizeof(pkt.chap) + data_size);
-
-  pkt.ph.proto_ = htons(PPP_PROTO_CHAN_HANDSHAKE_AUTH);
-
-  pkt.chap.code_ = CHAP_RESPONSE;
-  pkt.chap.id_ = id;
-  pkt.chap.len_ = htons(sizeof(pkt.chap) + data_size);
-
-  char s = MD5_DIGEST_LENGTH;
-  memcpy(pkt.data, &s, 1);
-  memcpy(pkt.data + 1, digest, MD5_DIGEST_LENGTH);
-  memcpy(pkt.data + 1 + MD5_DIGEST_LENGTH, name_.data(), name_.size());
-
-  return sock_ptr_->send_frame(&pkt,
-                               pkt.data + 1 + MD5_DIGEST_LENGTH + name_.size() -
-                                   reinterpret_cast<unsigned char *>(&pkt),
-                               (struct sockaddr *)&dst, sizeof(dst));
+  return sock_ptr_->send_frame(&pkt, sizeof(pkt), (struct sockaddr *)&dst,
+                               sizeof(dst));
 }
 
 bool PPPoEWorker::send_padr(struct PPPoEServer &server) {
@@ -512,46 +600,13 @@ bool PPPoEWorker::send_chap_reply(const MacAddr server_mac,
 
   cache_[session_id] = name_;  // update cache info
 
-  unsigned char digest[EVP_MAX_MD_SIZE];  // Buffer para o resultado do digest
-  unsigned int digest_len;  // Tamanho do digest gerado
+  MD5_CTX ctx;
+  MD5_Init(&ctx);
+  MD5_Update(&ctx, &idbyte, 1);
+  MD5_Update(&ctx, (unsigned char *)secret_.c_str(), secret_.size());
+  MD5_Update(&ctx, chal, chal_size);
+  MD5_Final(digest, &ctx);
 
-  EVP_MD_CTX* ctx = EVP_MD_CTX_new();  // Substituir MD5_CTX por EVP_MD_CTX
-
-  if (!EVP_DigestInit_ex(ctx, EVP_md5(), NULL)) {
-       // Tratar erro de inicialização
-      EVP_MD_CTX_free(ctx);
-      return false;
-  }
-
-  if (!EVP_DigestUpdate(ctx, &idbyte, 1)) {
-      // Tratar erro de atualização
-      EVP_MD_CTX_free(ctx);
-      return false;
-  }
-
-  if (!EVP_DigestUpdate(ctx, secret_.c_str(), secret_.size())) {
-      // Tratar erro de atualização
-      EVP_MD_CTX_free(ctx);
-      return false;
-  }
-
-  if (!EVP_DigestUpdate(ctx, chal, chal_size)) {
-      // Tratar erro de atualização
-      EVP_MD_CTX_free(ctx);
-      return false;
-  }
-
-  // Finalize o digest
-  if (!EVP_DigestFinal_ex(ctx, digest, &digest_len)) {
-      // Tratar erro de finalização
-      EVP_MD_CTX_free(ctx);
-      return false;
-  }
-
-  EVP_MD_CTX_free(ctx);  // Liberar o contexto
-
-
-  
   dst.sll_ifindex = src_if_index_;
   dst.sll_halen = ETH_ALEN;
   memcpy(dst.sll_addr, server_mac, sizeof(MacAddr));
@@ -1721,4 +1776,3 @@ void PPPoEWorker::check_echo_expired()
     }
   }
 }
-
